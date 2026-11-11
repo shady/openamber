@@ -19,14 +19,9 @@ static const char *SWITCHBOT_TAG = "switchbot_ble";
 // never drop the room temperature, while a dead or out-of-range sensor still
 // raises B01 within reasonable time.
 static const uint32_t SWITCHBOT_READING_TIMEOUT_MS = 600000;
-// Scanning is passive: Meter, Meter Plus and Outdoor Meter broadcast their
-// readings in the manufacturer data of every advertisement. Active scanning
-// makes every BLE device in range answer with a scan response, which costs the
-// sensors battery, so it only runs while it is needed: during discovery, for a
-// paired sensor whose model is not known yet (the model byte is only in the
-// scan response), and for a paired sensor that sent nothing for this long
-// (older Meter firmware only reports readings in the scan response).
-static const uint32_t SWITCHBOT_PASSIVE_GRACE_MS = 120000;
+// Active scanning is limited to discovery and initial model identification.
+// Normal tracking uses advertisements, so a missing sensor cannot leave the
+// scanner requesting responses from every nearby device indefinitely.
 
 struct SwitchbotReading
 {
@@ -64,6 +59,7 @@ struct SwitchbotSlot
     bool valid = false;         // mac parsed
     SwitchbotReading reading;
     uint8_t model = 0;          // model byte, 0 until its scan response is seen
+    bool identifying = false;  // bounded active scan for an unknown paired model
     uint32_t tracking_since_ms = 0; // when tracking started (0: BLE off)
     bool timed_out = false;     // no reading for the full timeout; cleared by a fresh reading
 };
@@ -504,29 +500,25 @@ static uint32_t switchbot_now_nonzero()
     return millis() ? millis() : 1;
 }
 
-// True while a paired sensor needs scan responses: its model is unknown, or it
-// has sent nothing for SWITCHBOT_PASSIVE_GRACE_MS.
-static bool switchbot_slot_needs_active_scan(const SwitchbotSlot &slot)
-{
-    if (!slot.valid)
-        return false;
-    if (!switchbot_is_meter_model(slot.model) || slot.timed_out)
-        return true;
-    uint32_t since = slot.reading.received_ms ? slot.reading.received_ms : slot.tracking_since_ms;
-    return uint32_t(millis() - since) >= SWITCHBOT_PASSIVE_GRACE_MS;
-}
-
 // Switch the tracker between passive and active scanning, the way ESPHome's
 // bluetooth_proxy does: the scan restarts with the new mode once it stopped.
 static void switchbot_set_scan_active(bool active)
 {
     auto *tracker = esphome::esp32_ble_tracker::global_esp32_ble_tracker;
-    if (tracker == nullptr || tracker->get_scan_active() == active)
+    if (tracker == nullptr || esphome::esp32_ble::global_ble == nullptr ||
+        !esphome::esp32_ble::global_ble->is_active() || tracker->get_scan_active() == active)
         return;
+    using esphome::esp32_ble_tracker::ScannerState;
+    auto state = tracker->get_scanner_state();
+    if (state != ScannerState::IDLE && state != ScannerState::RUNNING)
+        return; // Let an in-flight start or stop finish before changing mode.
     ESP_LOGD(SWITCHBOT_TAG, "Scanning %s", active ? "active" : "passive");
     tracker->set_scan_active(active);
-    tracker->stop_scan();
-    tracker->set_scan_continuous(true);
+    if (state == ScannerState::RUNNING)
+    {
+        tracker->stop_scan();
+        tracker->set_scan_continuous(true);
+    }
 }
 
 // `enabled` is the Bluetooth switch, `source` the slot used as room temperature
@@ -546,17 +538,24 @@ static void switchbot_update(bool enabled, int source, const std::string *const 
     for (unsigned i = 0; i < SWITCHBOT_SLOTS; i++)
     {
         SwitchbotSlot &slot = switchbot_slots[i];
+        const std::string &mac = *macs[i];
+        SwitchbotAddress address;
+        bool valid = switchbot_parse_mac(mac, address);
+        // Replacing or removing a MAC invalidates its saved identity, even
+        // while Bluetooth is off. Disabling Bluetooth alone keeps the pairing.
+        if (!valid || !switchbot_stored_model(*models[i], address))
+            *models[i] = 0;
         if (!enabled)
         {
             slot = {};
             continue;
         }
-        const std::string &mac = *macs[i];
         if (mac != slot.mac || slot.tracking_since_ms == 0)
         {
             slot = {};
             slot.mac = mac;
-            slot.valid = switchbot_parse_mac(mac, slot.address);
+            slot.valid = valid;
+            slot.address = address;
             // The stored model, or the discovery list for a sensor paired from it.
             if (slot.valid)
                 slot.model = switchbot_stored_model(*models[i], slot.address);
@@ -564,9 +563,13 @@ static void switchbot_update(bool enabled, int source, const std::string *const 
                 if (slot.valid && !slot.model && device.model && memcmp(device.address.val, slot.address.val, 6) == 0)
                     slot.model = device.model;
             slot.tracking_since_ms = switchbot_now_nonzero();
+            slot.identifying = slot.valid && !slot.model;
             if (!slot.valid && !mac.empty())
                 ESP_LOGW(SWITCHBOT_TAG, "Invalid SwitchBot MAC in slot %u", i + 1);
         }
+        // Discovery can retry identification; a reading gap alone cannot.
+        if (slot.model || uint32_t(switchbot_now_nonzero() - slot.tracking_since_ms) >= SWITCHBOT_DISCOVERY_MS)
+            slot.identifying = false;
         if (slot.reading.valid && uint32_t(millis() - slot.reading.received_ms) >= SWITCHBOT_READING_TIMEOUT_MS)
             slot.reading.valid = false;
         if (switchbot_slot_fresh(i))
@@ -583,11 +586,11 @@ static void switchbot_update(bool enabled, int source, const std::string *const 
             *models[i] != switchbot_model_key(slot.address, slot.model))
             *models[i] = switchbot_model_key(slot.address, slot.model);
     }
-    if (enabled)
+    if (enabled && switchbot_ble_requested && !switchbot_host_failed)
     {
         bool active = switchbot_discovering;
         for (const auto &slot : switchbot_slots)
-            active |= switchbot_slot_needs_active_scan(slot);
+            active |= slot.identifying;
         switchbot_set_scan_active(active);
     }
     switchbot_publish();
